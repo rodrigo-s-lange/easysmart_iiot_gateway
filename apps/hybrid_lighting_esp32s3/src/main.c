@@ -1,16 +1,40 @@
 #include <errno.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/drivers/led_strip.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/sys/printk.h>
+#include <zephyr/net/net_if.h>
+#include <zephyr/net/net_mgmt.h>
+#include <zephyr/net/wifi.h>
+#include <zephyr/net/wifi_mgmt.h>
 
 #include <gateway_engine/gw_engine.h>
 #include <gateway_engine/gw_link_proto.h>
 
 LOG_MODULE_REGISTER(hybrid_lighting_gateway, LOG_LEVEL_INF);
+
+#define LAB_WIFI_EVENTS (NET_EVENT_WIFI_CONNECT_RESULT | NET_EVENT_WIFI_DISCONNECT_RESULT)
+#define LAB_WIFI_RETRY_MS 5000U
+#define LAB_ENGINE_RETRY_MS 5000U
+
+#if DT_NODE_HAS_STATUS(DT_ALIAS(led_strip), okay)
+#define LAB_HAS_DEBUG_LED 1
+#else
+#define LAB_HAS_DEBUG_LED 0
+#endif
+
+typedef enum {
+    DEBUG_LED_OFF = 0,
+    DEBUG_LED_RED,
+    DEBUG_LED_GREEN,
+    DEBUG_LED_BLUE,
+} debug_led_state_t;
 
 typedef struct {
     uint8_t is_on;
@@ -25,8 +49,19 @@ typedef struct {
     gw_engine_t engine;
     gw_transport_t transport;
     gw_transport_internal_t internal_backend;
+    struct net_if *wifi_iface;
+    struct net_mgmt_event_callback wifi_cb;
+    bool wifi_connected;
+    bool wifi_connect_pending;
+    bool engine_started;
+    uint32_t last_wifi_attempt_ms;
+    uint32_t last_engine_attempt_ms;
     uint32_t last_scene_log_ms;
+    debug_led_state_t led_state;
+    const struct device *led_strip;
 } lab_ctx_t;
+
+static lab_ctx_t *g_lab_ctx;
 
 static int edge_build_ack(const gw_link_frame_view_t *view, uint8_t *rx_data, size_t rx_cap, size_t *rx_len)
 {
@@ -172,6 +207,274 @@ static int gateway_send_lighting_telemetry(gw_engine_t *engine, const edge_light
     return gw_engine_send(engine, GW_LINK_CMD_TELEMETRY, (const uint8_t *)payload, (uint16_t)n);
 }
 
+static const struct device *lab_get_led_strip(void)
+{
+#if LAB_HAS_DEBUG_LED
+    return DEVICE_DT_GET(DT_ALIAS(led_strip));
+#else
+    return NULL;
+#endif
+}
+
+static int lab_set_debug_led(lab_ctx_t *lab, debug_led_state_t next)
+{
+    struct led_rgb pixel;
+    int rc;
+
+    if (lab == NULL || lab->led_strip == NULL) {
+        return -ENODEV;
+    }
+
+    if (!device_is_ready(lab->led_strip)) {
+        return -ENODEV;
+    }
+
+    if (lab->led_state == next) {
+        return 0;
+    }
+
+    (void)memset(&pixel, 0, sizeof(pixel));
+
+    switch (next) {
+    case DEBUG_LED_RED:
+        pixel.r = 64U;
+        break;
+    case DEBUG_LED_GREEN:
+        pixel.g = 64U;
+        break;
+    case DEBUG_LED_BLUE:
+        pixel.b = 64U;
+        break;
+    case DEBUG_LED_OFF:
+    default:
+        break;
+    }
+
+    rc = led_strip_update_rgb(lab->led_strip, &pixel, 1U);
+    if (rc != 0) {
+        return rc;
+    }
+
+    lab->led_state = next;
+    return 0;
+}
+
+static void lab_refresh_debug_led(lab_ctx_t *lab)
+{
+    debug_led_state_t target = DEBUG_LED_RED;
+    bool mqtt_connected;
+
+    if (lab == NULL) {
+        return;
+    }
+
+    mqtt_connected = lab->wifi_connected && lab->engine_started && lab->engine.cloud.connected;
+
+    if (lab->wifi_connected && mqtt_connected) {
+        target = DEBUG_LED_BLUE;
+    } else if (lab->wifi_connected) {
+        target = DEBUG_LED_GREEN;
+    }
+
+    if (lab_set_debug_led(lab, target) != 0) {
+        return;
+    }
+}
+
+static void lab_wifi_event_handler(struct net_mgmt_event_callback *cb, uint64_t mgmt_event, struct net_if *iface)
+{
+    const struct wifi_status *status;
+    lab_ctx_t *lab = g_lab_ctx;
+
+    if (lab == NULL || iface != lab->wifi_iface) {
+        return;
+    }
+
+    status = (const struct wifi_status *)cb->info;
+
+    switch (mgmt_event) {
+    case NET_EVENT_WIFI_CONNECT_RESULT:
+        lab->wifi_connect_pending = false;
+        if (status != NULL && status->status == 0) {
+            lab->wifi_connected = true;
+            LOG_INF("wifi connected");
+        } else {
+            lab->wifi_connected = false;
+            LOG_WRN("wifi connect failed: %d", (status != NULL) ? status->status : -EIO);
+        }
+        break;
+
+    case NET_EVENT_WIFI_DISCONNECT_RESULT:
+        lab->wifi_connected = false;
+        lab->wifi_connect_pending = false;
+        LOG_WRN("wifi disconnected: %d", (status != NULL) ? status->status : 0);
+        break;
+
+    default:
+        break;
+    }
+}
+
+static int lab_wifi_status_sync(lab_ctx_t *lab)
+{
+    struct wifi_iface_status status;
+    int rc;
+
+    if (lab == NULL || lab->wifi_iface == NULL) {
+        return -EINVAL;
+    }
+
+    (void)memset(&status, 0, sizeof(status));
+
+    rc = net_mgmt(
+        NET_REQUEST_WIFI_IFACE_STATUS,
+        lab->wifi_iface,
+        &status,
+        sizeof(struct wifi_iface_status));
+    if (rc != 0) {
+        return rc;
+    }
+
+    lab->wifi_connected = (status.state == WIFI_STATE_COMPLETED);
+    return 0;
+}
+
+static int lab_wifi_connect_request(lab_ctx_t *lab)
+{
+    struct wifi_connect_req_params params;
+    size_t ssid_len;
+    size_t psk_len;
+
+    if (lab == NULL || lab->wifi_iface == NULL) {
+        return -EINVAL;
+    }
+
+    if (lab->wifi_connected || lab->wifi_connect_pending) {
+        return 0;
+    }
+
+    ssid_len = strlen(CONFIG_HYBRID_WIFI_SSID);
+    if (ssid_len == 0U) {
+        return -ENODATA;
+    }
+
+    psk_len = strlen(CONFIG_HYBRID_WIFI_PSK);
+
+    (void)memset(&params, 0, sizeof(params));
+    params.ssid = (const uint8_t *)CONFIG_HYBRID_WIFI_SSID;
+    params.ssid_length = (uint8_t)ssid_len;
+    params.band = WIFI_FREQ_BAND_UNKNOWN;
+    params.channel = WIFI_CHANNEL_ANY;
+    params.mfp = WIFI_MFP_OPTIONAL;
+
+    if (psk_len > 0U) {
+        params.security = WIFI_SECURITY_TYPE_PSK;
+        params.psk = (const uint8_t *)CONFIG_HYBRID_WIFI_PSK;
+        params.psk_length = (uint8_t)psk_len;
+    } else {
+        params.security = WIFI_SECURITY_TYPE_NONE;
+    }
+
+    lab->wifi_connect_pending = true;
+
+    return net_mgmt(
+        NET_REQUEST_WIFI_CONNECT,
+        lab->wifi_iface,
+        &params,
+        sizeof(struct wifi_connect_req_params));
+}
+
+static int lab_wifi_init(lab_ctx_t *lab)
+{
+    if (lab == NULL) {
+        return -EINVAL;
+    }
+
+    lab->wifi_iface = net_if_get_default();
+    if (lab->wifi_iface == NULL) {
+        return -ENODEV;
+    }
+
+    g_lab_ctx = lab;
+
+    net_mgmt_init_event_callback(&lab->wifi_cb, lab_wifi_event_handler, LAB_WIFI_EVENTS);
+    net_mgmt_add_event_callback(&lab->wifi_cb);
+
+    if (lab_wifi_status_sync(lab) == 0 && lab->wifi_connected) {
+        LOG_INF("wifi already connected");
+    }
+
+    if (strlen(CONFIG_HYBRID_WIFI_SSID) == 0U) {
+        LOG_WRN("CONFIG_HYBRID_WIFI_SSID is empty; wifi connect disabled");
+    }
+
+    return 0;
+}
+
+static void lab_wifi_poll(lab_ctx_t *lab, uint32_t now_ms)
+{
+    int rc;
+
+    if (lab == NULL || lab->wifi_connected || lab->wifi_connect_pending) {
+        return;
+    }
+
+    if (strlen(CONFIG_HYBRID_WIFI_SSID) == 0U) {
+        return;
+    }
+
+    if ((now_ms - lab->last_wifi_attempt_ms) < LAB_WIFI_RETRY_MS) {
+        return;
+    }
+
+    lab->last_wifi_attempt_ms = now_ms;
+
+    rc = lab_wifi_connect_request(lab);
+    if (rc != 0) {
+        lab->wifi_connect_pending = false;
+        LOG_WRN("wifi connect request failed: %d", rc);
+    } else {
+        LOG_INF("wifi connect requested");
+    }
+}
+
+static void lab_engine_poll(lab_ctx_t *lab, uint32_t now_ms)
+{
+    int rc;
+
+    if (lab == NULL) {
+        return;
+    }
+
+    if (!lab->wifi_connected) {
+        if (lab->engine_started) {
+            (void)gw_engine_stop(&lab->engine);
+            lab->engine_started = false;
+            LOG_WRN("engine stopped due to wifi disconnect");
+        }
+        return;
+    }
+
+    if (lab->engine_started) {
+        return;
+    }
+
+    if ((now_ms - lab->last_engine_attempt_ms) < LAB_ENGINE_RETRY_MS) {
+        return;
+    }
+
+    lab->last_engine_attempt_ms = now_ms;
+
+    rc = gw_engine_start(&lab->engine);
+    if (rc == 0) {
+        lab->engine_started = true;
+        LOG_INF("engine started");
+        return;
+    }
+
+    LOG_WRN("engine start failed: %d", rc);
+}
+
 static int lab_init(lab_ctx_t *lab)
 {
     gw_transport_internal_config_t internal_cfg;
@@ -187,6 +490,13 @@ static int lab_init(lab_ctx_t *lab)
     lab->edge.is_on = 1U;
     lab->edge.scene = 0U;
     lab->edge.brightness = 40U;
+    lab->led_state = DEBUG_LED_OFF;
+
+    lab->led_strip = lab_get_led_strip();
+    if (lab->led_strip != NULL && !device_is_ready(lab->led_strip)) {
+        LOG_WRN("debug led strip present but not ready");
+        lab->led_strip = NULL;
+    }
 
     internal_cfg.exchange_cb = internal_exchange_cb;
     internal_cfg.user_data = lab;
@@ -217,7 +527,7 @@ static int lab_init(lab_ctx_t *lab)
         return rc;
     }
 
-    rc = gw_engine_start(&lab->engine);
+    rc = lab_wifi_init(lab);
     if (rc != 0) {
         return rc;
     }
@@ -240,25 +550,29 @@ int main(void)
     LOG_INF("Hybrid lighting lab started on profile=%s", gw_engine_profile_name(&lab.engine));
 
     while (true) {
-        int64_t now_ms = k_uptime_get();
+        uint32_t now_ms = k_uptime_get_32();
+
+        lab_wifi_poll(&lab, now_ms);
+        lab_engine_poll(&lab, now_ms);
+        lab_refresh_debug_led(&lab);
 
         edge_simulate_animation(&lab.edge);
 
-        if ((loop_count % 10U) == 0U) {
+        if (lab.engine_started && (loop_count % 10U) == 0U) {
             rc = gateway_send_heartbeat(&lab.engine);
             if (rc != 0) {
                 LOG_WRN("heartbeat send failed: %d", rc);
             }
         }
 
-        if ((loop_count % 5U) == 0U) {
+        if (lab.engine_started && (loop_count % 5U) == 0U) {
             rc = gateway_send_lighting_telemetry(&lab.engine, &lab.edge);
             if (rc != 0) {
                 LOG_WRN("telemetry send failed: %d", rc);
             }
         }
 
-        if ((loop_count % 200U) == 0U) {
+        if (lab.engine_started && (loop_count % 200U) == 0U) {
             uint8_t next_scene = (uint8_t)((lab.edge.scene + 1U) % 3U);
             rc = gateway_send_control(&lab.engine, 0x03, next_scene);
             if (rc == 0) {
@@ -266,20 +580,25 @@ int main(void)
             }
         }
 
-        rc = gw_engine_step(&lab.engine);
-        if (rc != 0) {
-            LOG_ERR("engine step failed: %d", rc);
-            break;
+        if (lab.engine_started) {
+            rc = gw_engine_step(&lab.engine);
+            if (rc != 0) {
+                LOG_WRN("engine step failed: %d", rc);
+                (void)gw_engine_stop(&lab.engine);
+                lab.engine_started = false;
+            }
         }
 
-        if ((now_ms - (int64_t)lab.last_scene_log_ms) >= 1000) {
-            lab.last_scene_log_ms = (uint32_t)now_ms;
+        if ((now_ms - lab.last_scene_log_ms) >= 1000U) {
+            lab.last_scene_log_ms = now_ms;
             LOG_INF(
-                "edge state on=%u brightness=%u scene=%u hb=%u",
+                "edge state on=%u brightness=%u scene=%u hb=%u wifi=%u mqtt=%u",
                 (unsigned int)lab.edge.is_on,
                 (unsigned int)lab.edge.brightness,
                 (unsigned int)lab.edge.scene,
-                (unsigned int)lab.edge.heartbeat_count);
+                (unsigned int)lab.edge.heartbeat_count,
+                (unsigned int)lab.wifi_connected,
+                (unsigned int)(lab.engine_started && lab.engine.cloud.connected));
         }
 
         loop_count++;
