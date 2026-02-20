@@ -1,0 +1,4 @@
+name: easysmart_gateway_engine
+build:
+  cmake: gateway_engine
+  kconfig: gateway_engine/Kconfig

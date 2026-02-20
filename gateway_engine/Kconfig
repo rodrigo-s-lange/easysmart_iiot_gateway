@@ -1,0 +1,55 @@
+menu "EasySmart Gateway Engine"
+
+config GW_ENGINE
+    bool "Enable gateway engine"
+    default y
+
+if GW_ENGINE
+
+config GW_ENGINE_TRANSPORT_SPI
+    bool "Enable SPI transport backend"
+    default y
+
+config GW_ENGINE_TRANSPORT_UART
+    bool "Enable UART transport backend"
+    default y
+
+config GW_ENGINE_TRANSPORT_INTERNAL
+    bool "Enable INTERNAL transport backend"
+    default y
+
+config GW_ENGINE_PORTS_ZEPHYR
+    bool "Use Zephyr hardware ports for SPI/UART"
+    default y if ZEPHYR
+    depends on ZEPHYR
+    select SPI if GW_ENGINE_TRANSPORT_SPI
+    select SERIAL if GW_ENGINE_TRANSPORT_UART
+
+choice GW_ENGINE_CLOUD_BACKEND
+    prompt "Cloud connector backend"
+    default GW_ENGINE_CLOUD_ZEPHYR if ZEPHYR
+    default GW_ENGINE_CLOUD_STUB
+
+config GW_ENGINE_CLOUD_ZEPHYR
+    bool "Zephyr cloud connector (HTTP bootstrap + MQTT over WSS)"
+    depends on ZEPHYR
+    select NET_SOCKETS
+    select NET_SOCKETS_SOCKOPT_TLS
+    select HTTP_CLIENT
+    select MQTT_LIB
+    select MQTT_LIB_WEBSOCKET
+    select MQTT_LIB_TLS
+    select POSIX_API
+
+config GW_ENGINE_CLOUD_STUB
+    bool "Stub cloud connector"
+
+endchoice
+
+config GW_ENGINE_OTA_STUB
+    bool "Use stub OTA orchestrator"
+    default y
+
+endif
+
+endmenu

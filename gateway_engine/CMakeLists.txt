@@ -1,0 +1,21 @@
+zephyr_library()
+zephyr_library_include_directories(include)
+zephyr_include_directories(include)
+
+zephyr_library_sources(
+  src/gw_engine.c
+  src/gw_profile.c
+  src/gw_crc16.c
+  src/link/gw_link_proto.c
+)
+
+zephyr_library_sources_ifdef(CONFIG_GW_ENGINE_CLOUD_STUB src/cloud/gw_cloud_stub.c)
+zephyr_library_sources_ifdef(CONFIG_GW_ENGINE_CLOUD_ZEPHYR src/cloud/gw_cloud_zephyr.c)
+zephyr_library_sources_ifdef(CONFIG_GW_ENGINE_CLOUD_ZEPHYR src/cloud/gw_sha256.c)
+zephyr_library_sources_ifdef(CONFIG_GW_ENGINE_OTA_STUB src/ota/gw_ota_stub.c)
+zephyr_library_sources_ifdef(CONFIG_GW_ENGINE_TRANSPORT_SPI src/transport/gw_transport_spi.c)
+zephyr_library_sources_ifdef(CONFIG_GW_ENGINE_TRANSPORT_UART src/transport/gw_transport_uart.c)
+zephyr_library_sources_ifdef(CONFIG_GW_ENGINE_TRANSPORT_INTERNAL src/transport/gw_transport_internal.c)
+zephyr_library_sources(src/transport/gw_transport_common.c)
+zephyr_library_sources_ifdef(CONFIG_GW_ENGINE_PORTS_ZEPHYR src/ports/gw_port_spi_zephyr.c)
+zephyr_library_sources_ifdef(CONFIG_GW_ENGINE_PORTS_ZEPHYR src/ports/gw_port_uart_zephyr.c)
